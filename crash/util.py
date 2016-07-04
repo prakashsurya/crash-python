@@ -214,3 +214,10 @@ class TypesUtilClass(CrashBaseClass):
     @staticmethod
     def array_size(value):
         return value.type.sizeof // value[0].type.sizeof
+
+def find_member_variant(gdbtype, variants):
+    for v in variants:
+        if v in gdbtype:
+            return v
+    raise TypeError("Unrecognized '%s': could not find member '%s'" %
+                        (str(gdbtype), variants[0]))
