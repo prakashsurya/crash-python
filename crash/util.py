@@ -217,7 +217,7 @@ class TypesUtilClass(CrashBaseClass):
 
 def find_member_variant(gdbtype, variants):
     for v in variants:
-        if v in gdbtype:
+        if offsetof(gdbtype, v, False) is not None:
             return v
     raise TypeError("Unrecognized '%s': could not find member '%s'" %
                         (str(gdbtype), variants[0]))
