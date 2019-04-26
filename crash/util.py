@@ -389,6 +389,26 @@ class TypesUtilClass(CrashBaseClass):
             yield value[i]
 
     @export
+    @staticmethod
+    def decode_flags(value, names, separator="|"):
+        if not isinstance(value, gdb.Value):
+            raise TypeError("value must be gdb.Value")
+
+        if not isinstance(names, dict):
+            raise TypeError("names must be a dictionary of int -> str")
+
+        flags_val = int(value)
+        flags = []
+        for n in range(0, value.type.sizeof << 3):
+            if flags_val & (1 << n):
+                try:
+                    flags.append(names[1 << n])
+                except KeyError:
+                    flags.append("FLAG_{}".format(n))
+
+        return separator.join(flags)
+
+    @export
     @classmethod
     def decode_uuid(cls, value):
         if not isinstance(value, gdb.Value):
