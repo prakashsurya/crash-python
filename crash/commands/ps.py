@@ -522,7 +522,7 @@ EXAMPLES
             TF.TASK_RUNNING         : "RU",
             TF.TASK_INTERRUPTIBLE   : "IN",
             TF.TASK_UNINTERRUPTIBLE : "UN",
-            TF.TASK_ZOMBIE          : "ZO",
+            TF.EXIT_ZOMBIE          : "ZO",
             TF.TASK_STOPPED         : "ST",
         }
 
@@ -540,10 +540,7 @@ EXAMPLES
         sort_by_last_run = lambda x: -x.info.last_run()
 
         if not hasattr(self, 'task_states'):
-            try:
-                self.setup_task_states()
-            except AttributeError:
-                raise CommandLineError("The task subsystem is not available.")
+            self.setup_task_states()
 
         sort_by = sort_by_pid
         if argv.l:
