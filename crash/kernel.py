@@ -3,6 +3,8 @@
 
 import gdb
 import sys
+import re
+import fnmatch
 import os.path
 import crash.arch
 import crash.arch.x86_64
@@ -13,6 +15,7 @@ from crash.types.percpu import get_percpu_var
 from crash.types.list import list_for_each_entry
 from crash.types.module import for_each_module, for_each_module_section
 import crash.cache.tasks
+import crash.cache.syscache
 from crash.types.task import LinuxTask
 from elftools.elf.elffile import ELFFile
 from crash.util import get_symbol_value
@@ -23,14 +26,236 @@ class CrashKernelError(RuntimeError):
 LINUX_KERNEL_PID = 1
 
 class CrashKernel(CrashBaseClass):
+    __types__ = [ 'char *' ]
     __symvals__ = [ 'init_task' ]
     __symbols__ = [ 'runqueues']
 
-    def __init__(self, searchpath=None):
+
+    def __init__(self, roots=None, vmlinux_debuginfo=None, module_path=None,
+                 module_debuginfo_path=None, verbose=False, debug=False):
+        """
+        Initialize a basic kernel semantic debugging session.
+
+        This means that we load the following:
+        - Kernel image symbol table (and debuginfo, if not integrated)
+          relocated to the base offset used by kASLR
+        - Kernel modules that were loaded on the the crashed system (again,
+          with debuginfo if not integrated)
+        - Percpu ranges used by kernel module
+        - Architecture-specific details
+        - Linux tasks populated into the GDB thread table
+
+        If kernel module files and debuginfo cannot be located, backtraces
+        may be incomplete if the addresses used by the modules are crossed.
+        Percpu ranges will be properly loaded regardless.
+
+        For arguments that accept paths to specify a base directory to be
+        used, the entire directory structure will be read and cached to
+        speed up subsequent searches.  Still, reading large directory trees
+        is a time consuming operation and being exact as possible will
+        improve startup time.
+
+        Args:
+            root (str or list of str, None for defaults): The roots of trees
+                to search for debuginfo files.  When specified, all roots
+                will be searched using the following arguments (including
+                the absolute paths in the defaults if unspecified).
+
+                Defaults to: /
+
+            vmlinux_debuginfo (str or list of str, None for defaults): The
+                location of the separate debuginfo file corresponding
+                to the kernel being debugged.
+
+                Defaults to:
+                - <loaded kernel path>.debug
+                - ./vmlinux-<kernel version>.debug
+                - /usr/lib/debug/.build-id/xx/<build-id>.debug
+                - /usr/lib/debug/<loaded kernel path>.debug
+                - /usr/lib/debug/boot/<loaded kernel name>.debug
+                - /usr/lib/debug/boot/vmlinux-<kernel version>
+
+            module_path (string, None for defaults): The base directory to
+                be used to search for kernel modules (e.g. module.ko) to be
+                used to load symbols for the kernel being debugged.
+
+                Defaults to:
+                - ./modules
+                - /usr/lib/modules/$version
+
+            module_debuginfo_path (string, None for defaults): The base
+                directory to search for debuginfo matching the kernel
+                modules already loaded.
+
+                Defaults to:
+                - ./modules.debug
+                - /usr/lib/debug/.build-id/xx/<build-id>.debug
+                - /usr/lib/debug/lib/modules/$version
+        Raises:
+            CrashKernelError: If the kernel debuginfo cannot be loaded.
+            TypeError: If any of the arguments are not None, str,
+                       or list of str
+
+        """
         self.findmap = {}
-        self.searchpath = searchpath
+        self.modules_order = {}
         obj = gdb.objfiles()[0]
         kernel = os.path.basename(obj.filename)
+        debugroot = "/usr/lib/debug"
+
+        version = self.extract_version()
+
+        if roots is None:
+            self.roots = [ "/" ]
+        elif (isinstance(roots, list) and len(roots) > 0 and
+              isinstance(roots[0], str)):
+            x = None
+            for root in roots:
+                if os.path.exists(root):
+                    if x is None:
+                        x = [ root ]
+                    else:
+                        x.append(root)
+                else:
+                    print("root {} does not exist".format(root))
+
+            if x is None:
+                x = [ "/" ]
+            self.roots = x
+        elif (isinstance(roots, str)):
+            x = None
+            if os.path.exists(roots):
+                if x is None:
+                    x = [ roots ]
+                else:
+                    x.append(roots)
+            if x is None:
+                 x = [ "/" ]
+            self.roots = x
+        else:
+            raise TypeError("roots must be None, str, or list of str")
+
+        if verbose:
+            print("roots={}".format(self.roots))
+
+        if vmlinux_debuginfo is None:
+            x = []
+            defaults = [
+                "{}.debug".format(kernel),
+                "vmlinux-{}.debug".format(version),
+                "{}/{}.debug".format(debugroot, kernel),
+                "{}/boot/{}.debug".format(debugroot,
+                                                   os.path.basename(kernel)),
+                "{}/boot/vmlinux-{}.debug".format(debugroot, version),
+            ]
+            for root in self.roots:
+                for mpath in defaults:
+                    path = "{}/{}".format(root, mpath)
+                    if os.path.exists(path):
+                        if x is None:
+                            x = [path]
+                        else:
+                            x.append(path)
+
+            self.vmlinux_debuginfo = x
+
+        elif (isinstance(vmlinux_debuginfo, list) and
+              len(vmlinux_debuginfo) > 0 and
+              isinstance(vmlinux_debuginfo[0], str)):
+            self.vmlinux_debuginfo = vmlinux_debuginfo
+        elif isinstance(vmlinux_debuginfo, str):
+            self.vmlinux_debuginfo = [ vmlinux_debuginfo ]
+        else:
+            raise TypeError("vmlinux_debuginfo must be None, str, or list of str")
+
+        if verbose:
+            print("vmlinux_debuginfo={}".format(self.vmlinux_debuginfo))
+
+        if module_path is None:
+            x = []
+
+            path = "modules"
+            if os.path.exists(path):
+                x.append(path)
+
+            for root in self.roots:
+                path = "{}/lib/modules/{}".format(root, version)
+                if os.path.exists(path):
+                    x.append(path)
+
+            self.module_path = x
+        elif (isinstance(module_path, list) and
+              isinstance(module_path[0], str)):
+            x = []
+
+            for root in self.roots:
+                for mpath in module_path:
+                    path = "{}/{}".format(root, mpath)
+                    if os.path.exists(path):
+                        x.append(path)
+
+            self.module_path = x
+        elif isinstance(module_path, str):
+            x = []
+
+            if os.path.exists(module_path):
+                x.append(module_path)
+
+            self.module_path = x
+        else:
+            raise TypeError("module_path must be None, str, or list of str")
+
+        if verbose:
+            print("module_path={}".format(self.module_path))
+
+        if module_debuginfo_path is None:
+            x = []
+
+            path = "modules.debug"
+            if os.path.exists(path):
+                x.append(path)
+
+            for root in self.roots:
+                path = "{}/{}/lib/modules/{}".format(root, debugroot, version)
+                if os.path.exists(path):
+                    x.append(path)
+            self.module_debuginfo_path = x
+        elif (isinstance(module_debuginfo_path, list) and
+              isinstance(module_debuginfo_path[0], str)):
+            x = []
+
+            for root in self.roots:
+                for mpath in module_debuginfo_path:
+                    path = "{}/{}".format(root, mpath)
+                    if os.path.exists(path):
+                        x.append(path)
+
+            self.module_debuginfo_path = x
+        elif isinstance(module_debuginfo_path, str):
+            x = []
+
+            for root in self.roots:
+                path = "{}/{}".format(root, module_debuginfo_path)
+                if os.path.exists(path):
+                    x.append(path)
+
+            self.module_debuginfo_path = x
+        else:
+            raise TypeError("module_debuginfo_path must be None, str, or list of str")
+
+        if verbose:
+            print("module_debuginfo_path={}".format(self.module_debuginfo_path))
+
+        # We need separate debuginfo.  Let's go find it.
+        if not obj.has_symbols():
+            print("Loading debug symbols for vmlinux")
+            for path in [self.build_id_path(obj)] + self.vmlinux_debuginfo:
+                try:
+                    obj.add_separate_debug_file(path)
+                    if obj.has_symbols():
+                        break
+                except gdb.error as e:
+                    pass
 
         if not obj.has_symbols():
             raise CrashKernelError("Couldn't locate debuginfo for {}"
@@ -49,6 +274,24 @@ class CrashKernel(CrashBaseClass):
         self.target.fetch_registers = self.fetch_registers
         self.crashing_thread = None
 
+    # When working without a symbol table, we still need to be able
+    # to resolve version information.
+    def get_minsymbol_as_string(self, name):
+        sym = gdb.lookup_minimal_symbol(name).value()
+
+        return sym.address.cast(self.char_p_type).string()
+
+    def extract_version(self):
+        try:
+            uts = get_symbol_value('init_uts_ns')
+            return release['release'].string()
+        except (AttributeError, NameError):
+            pass
+
+        banner = self.get_minsymbol_as_string('linux_banner')
+
+        return banner.split(' ')[2]
+
     def fetch_registers(self, register):
         thread = gdb.selected_thread()
         return self.arch.fetch_register(thread, register.regnum)
@@ -60,15 +303,18 @@ class CrashKernel(CrashBaseClass):
         return " ".join(out)
 
     def load_modules(self, verbose=False, debug=False):
-        print("Loading modules...", end='')
-        sys.stdout.flush()
+        version = crash.cache.syscache.utsname.release
+        print("Loading modules for {}".format(version), end='')
+        if verbose:
+            print(":", flush=True)
         failed = 0
         loaded = 0
         for module in for_each_module():
             modname = "{}".format(module['name'].string())
             modfname = "{}.ko".format(modname)
             found = False
-            for path in self.searchpath:
+            for path in self.module_path:
+
                 modpath = self.find_module_file(modfname, path)
                 if not modpath:
                     continue
@@ -106,7 +352,7 @@ class CrashKernel(CrashBaseClass):
 
                 objfile = gdb.lookup_objfile(modpath)
                 if not objfile.has_symbols():
-                    self.load_debuginfo(objfile, modpath)
+                    self.load_module_debuginfo(objfile, modpath, verbose)
                 elif debug:
                     print(" + has debug symbols")
 
@@ -120,6 +366,8 @@ class CrashKernel(CrashBaseClass):
                 print("Couldn't find module file for {}".format(modname))
                 failed += 1
             else:
+                if not objfile.has_symbols():
+                    print("Couldn't find debuginfo for {}".format(modname))
                 loaded += 1
             if (loaded + failed) % 10 == 10:
                 print(".", end='')
@@ -134,41 +382,123 @@ class CrashKernel(CrashBaseClass):
         del self.findmap
         self.findmap = {}
 
-    def find_module_file(self, name, path):
-        if not path in self.findmap:
-            self.findmap[path] = {}
+    @staticmethod
+    def normalize_modname(mod):
+        return mod.replace('-', '_')
 
-            for root, dirs, files in os.walk(path):
-                for filename in files:
-                    nname = filename.replace('-', '_')
-                    self.findmap[path][nname] = os.path.join(root, filename)
+    def cache_modules_order(self, path):
+        self.modules_order[path] = {}
+        order = os.path.join(path, "modules.order")
         try:
-            nname = name.replace('-', '_')
-            return self.findmap[path][nname]
+            f = open(order)
+            for line in f.readlines():
+                modpath = line.rstrip()
+                modname = self.normalize_modname(os.path.basename(modpath))
+                if modname[:7] == "kernel/":
+                    modname = modname[7:]
+                modpath = os.path.join(path, modpath)
+                if os.path.exists(modpath):
+                    self.modules_order[path][modname] = modpath
+            f.close()
+        except OSError:
+            pass
+
+    def get_module_path_from_modules_order(self, path, name):
+        if not path in self.modules_order:
+            self.cache_modules_order(path)
+
+        try:
+            return self.modules_order[path][name]
         except KeyError:
             return None
 
-    def load_debuginfo(self, objfile, name=None, verbose=False):
-        if name is None:
-            name = objfile.filename
-        if ".gz" in name:
-            name = name.replace(".gz", "")
-        filename = "{}.debug".format(os.path.basename(name))
+    def cache_file_tree(self, path, regex=None):
+        if not path in self.findmap:
+            self.findmap[path] = {
+                'filters' : [],
+                'files' : {},
+            }
+
+        # If we've walked this path with no filters, we have everything
+        # already.
+        if self.findmap[path]['filters'] is None:
+            return
+
+        if regex is None:
+            self.findmap[path]['filters'] = None
+        else:
+            pattern = regex.pattern
+            if pattern in self.findmap[path]['filters']:
+                return
+            self.findmap[path]['filters'].append(pattern)
+
+        for root, dirs, files in os.walk(path):
+            for filename in files:
+                modname = self.normalize_modname(filename)
+
+                if regex and regex.match(modname) is None:
+                    continue
+
+                modpath = os.path.join(root, filename)
+                self.findmap[path]['files'][modname] = modpath
+
+    def get_file_path_from_tree_search(self, path, name, regex=None):
+        self.cache_file_tree(path, regex)
+
+        try:
+            modname = self.normalize_modname(name)
+            return self.findmap[path]['files'][modname]
+        except KeyError:
+            return None
+
+    def find_module_file(self, name, path):
+        modpath = self.get_module_path_from_modules_order(path, name)
+        if modpath is not None:
+            return modpath
+
+        regex = re.compile(fnmatch.translate("*.ko"))
+        return self.get_file_path_from_tree_search(path, name, regex)
+
+    def find_module_debuginfo_file(self, name, path):
+        regex = re.compile(fnmatch.translate("*.ko.debug"))
+        return self.get_file_path_from_tree_search(path, name, regex)
+
+    @staticmethod
+    def build_id_path(objfile):
+        build_id = objfile.build_id
+        return ".build_id/{}/{}.debug".format(build_id[0:2], build_id[2:])
+
+    def try_load_debuginfo(self, objfile, path, verbose):
+        try:
+            if verbose:
+                print(" + Loading debuginfo: {}".format(path))
+            objfile.add_separate_debug_file(path)
+            if objfile.has_symbols():
+                return True
+        except gdb.error as e:
+            print(e)
+
+        return False
+
+    def load_module_debuginfo(self, objfile, modpath=None, verbose=False):
+        if modpath is None:
+            modpath = objfile.filename
+        if ".gz" in modpath:
+            modpath = modpath.replace(".gz", "")
+        filename = "{}.debug".format(os.path.basename(modpath))
         filepath = None
 
-        # Check current directory first
-        if os.path.exists(filename):
-            filepath = filename
-        else:
-            for path in self.searchpath:
-                filepath = self.find_module_file(filename, path)
-                if filepath:
-                    break
+        build_id_path = self.build_id_path(objfile)
 
-        if filepath:
-            objfile.add_separate_debug_file(filepath)
-        else:
-            print("Could not locate debuginfo for {}".format(name))
+        regex = re.compile(fnmatch.translate("*.debug"))
+        for path in self.module_debuginfo_path:
+            filepath = "{}/{}".format(path, build_id_path)
+            if self.try_load_debuginfo(filepath, verbose):
+                break
+
+            filepath = self.find_module_file(filename, path, regex)
+            if self.try_load_debuginfo(filepath, verbose):
+                break
 
     def setup_tasks(self):
         gdb.execute('set print thread-events 0')
