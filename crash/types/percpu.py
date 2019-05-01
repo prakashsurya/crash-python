@@ -5,6 +5,7 @@ import gdb
 from crash.infra import CrashBaseClass, export
 from crash.util import array_size, struct_has_member
 from crash.types.list import list_for_each_entry
+from crash.types.module import for_each_module
 from crash.exceptions import DelayedAttributeError
 from crash.types.bitmap import find_first_set_bit, find_last_set_bit
 from crash.types.bitmap import find_next_set_bit, find_next_zero_bit
@@ -39,6 +40,7 @@ class TypesPerCPUClass(CrashBaseClass):
         cls.static_ranges = { 0 : size }
         if cls.__per_cpu_start != 0:
             cls.static_ranges[cls.__per_cpu_start] = size
+        cls.module_ranges = {}
 
         try:
             # This is only an optimization so we don't return NR_CPUS values
@@ -55,6 +57,16 @@ class TypesPerCPUClass(CrashBaseClass):
             cls.last_cpu = cls.nr_cpus
 
     @classmethod
+    def setup_module_ranges(cls, modules):
+        for module in for_each_module():
+            start = int(module['percpu'])
+            if start == 0:
+                continue
+
+            size = int(module['percpu_size'])
+            cls.module_ranges[start] = size
+
+    @classmethod
     def __add_to_offset_cache(cls, base, start, end):
         cls.dynamic_offset_cache.append((base + start, base + end))
 
@@ -62,6 +74,8 @@ class TypesPerCPUClass(CrashBaseClass):
     def dump_ranges(cls):
         for (start, size) in cls.static_ranges.items():
             print(f"static start={start:#x}, size={size:#x}")
+        for (start, size) in self.module_ranges.items():
+            print(f"module start={start:#x}, size={size:#x}")
         if cls.dynamic_offset_cache is not None:
             for (start, end) in cls.dynamic_offset_cache:
                 print(f"dynamic start={start:#x}, end={end:#x}")
@@ -196,11 +210,22 @@ class TypesPerCPUClass(CrashBaseClass):
             return addr - start
         return addr
 
+    # The percpu virtual address
+    def is_module_percpu_var(self, addr):
+        for start in self.module_ranges:
+            for cpu in range(0, self.last_cpu):
+                size = self.module_ranges[start]
+                if addr >= start and addr < start + size:
+                    return True
+        return False
+
     @export
     def is_percpu_var(self, var):
         if isinstance(var, gdb.Symbol):
             var = var.value().address
         if self.is_static_percpu_var(var):
+            return True
+        if self.is_module_percpu_var(var):
             return True
         if self.__is_percpu_var_dynamic(var):
             return True
