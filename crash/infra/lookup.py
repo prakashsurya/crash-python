@@ -174,10 +174,13 @@ class DelayedType(TypeCallback, DelayedValue):
         Args:
             name (str): The name of the type.
         """
-        super().__init__(name, self.callback)
+        DelayedValue.__init__(self, name)
+
+        # This goes second because it may rewrite the name
+        TypeCallback.__init__(self, name, self.callback)
 
     def __str__(self):
-        return "{} attached with {}".format(self.__class__, str(self.cb))
+        return "{} attached with {}".format(self.__class__, str(self.callback))
 
     def callback(self, value):
         if self.pointer:
