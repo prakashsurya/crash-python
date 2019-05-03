@@ -31,7 +31,7 @@ class TypesCPUClass(CrashBaseClass):
     @export
     def highest_online_cpu_nr(self):
         if self.cpus_possible is None:
-            raise DelayedAttributeError(self.__class__.__name__, 'cpus_online')
+            raise DelayedAttributeError('cpus_online')
         return self.cpus_online[-1]
 
     @classmethod
@@ -48,6 +48,5 @@ class TypesCPUClass(CrashBaseClass):
     @export
     def highest_possible_cpu_nr(self):
         if self.cpus_possible is None:
-            raise DelayedAttributeError(self.__class__.__name__,
-                                        'cpus_possible')
+            raise DelayedAttributeError('cpus_possible')
         return self.cpus_possible[-1]
