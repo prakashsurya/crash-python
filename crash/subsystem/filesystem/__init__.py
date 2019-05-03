@@ -3,10 +3,13 @@
 
 import gdb
 from crash.util import container_of, get_typed_pointer, decode_flags
-from crash.infra import CrashBaseClass, export
+from crash.util.symbols import Types, Symvals
+from crash.infra.lookup import DelayedSymval, DelayedType
 from crash.types.list import list_for_each_entry
 from crash.subsystem.storage import block_device_name
-from crash.subsystem.storage import Storage as block
+
+types = Types('struct super_block')
+symvals = Symvals('super_blocks')
 
 MS_RDONLY       = 1
 MS_NOSUID       = 2
@@ -69,78 +72,63 @@ SB_FLAGS = {
     MS_NOUSER       : "MS_NOUSER",
 }
 
-class FileSystem(CrashBaseClass):
-    __types__ = [ 'struct dio *',
-                  'struct buffer_head *',
-                  'struct super_block' ]
-    __symvals__ = [ 'super_blocks' ]
-    @export
-    @staticmethod
-    def super_fstype(sb):
-        """
-        Returns the file system type's name for a given superblock.
+def super_fstype(sb):
+    """
+    Returns the file system type's name for a given superblock.
 
-        Args:
-            sb (gdb.Value<struct super_block>): The struct super_block for
-                which to return the file system type's name
+    Args:
+        sb (gdb.Value<struct super_block>): The struct super_block for
+            which to return the file system type's name
 
-        Returns:
-            str: The file system type's name
-        """
-        return sb['s_type']['name'].string()
+    Returns:
+        str: The file system type's name
+    """
+    return sb['s_type']['name'].string()
 
-    @export
-    @staticmethod
-    def super_flags(sb):
-        """
-        Returns the flags associated with the given superblock.
+def super_flags(sb):
+    """
+    Returns the flags associated with the given superblock.
 
-        Args:
-            sb (gdb.Value<struct super_block>): The struct super_block for
-                which to return the flags.
+    Args:
+        sb (gdb.Value<struct super_block>): The struct super_block for
+            which to return the flags.
 
-        Returns:
-            str: The flags field in human-readable form.
+    Returns:
+        str: The flags field in human-readable form.
 
-        """
-        return decode_flags(sb['s_flags'], SB_FLAGS)
+    """
+    return decode_flags(sb['s_flags'], SB_FLAGS)
 
-    @export
-    @classmethod
-    def for_each_super_block(cls):
-        """
-        Iterate over the list of super blocks and yield each one.
+def for_each_super_block():
+    """
+    Iterate over the list of super blocks and yield each one.
 
-        Args:
-            None
+    Args:
+        None
 
-        Yields:
-            gdb.Value<struct super_block>
-        """
-        for sb in list_for_each_entry(cls.super_blocks, cls.super_block_type,
-                                      's_list'):
-            yield sb
+    Yields:
+        gdb.Value<struct super_block>
+    """
+    for sb in list_for_each_entry(symvals.super_blocks,
+                                  types.super_block_type, 's_list'):
+        yield sb
 
-    @export
-    @classmethod
-    def get_super_block(desc):
-        """
-        Given an address description return a gdb.Value that contains
-        a struct super_block at that address.
+def get_super_block(desc):
+    """
+    Given an address description return a gdb.Value that contains
+    a struct super_block at that address.
 
-        Args:
-            desc (gdb.Value, str, or int): The address for which to provide
-                a casted pointer
+    Args:
+        desc (gdb.Value, str, or int): The address for which to provide
+            a casted pointer
 
-        Returns:
-            gdb.Value<struct super_block>: The super_block at the requested
-                location
-        """
-        sb = get_typed_pointer(desc, cls.super_block_type)
-        try:
-            x = sb['s_id'].string()
-        except gdb.error:
-            raise ValueError(f"`{desc}' does not describe a valid superblock")
-        return sb
-
-inst = FileSystem()
+    Returns:
+        gdb.Value<struct super_block>: The super_block at the requested
+            location
+    """
+    sb = get_typed_pointer(desc, types.super_block_type)
+    try:
+        x = sb['s_id'].string()
+    except gdb.error:
+        raise ValueError(f"`{desc}' does not describe a valid superblock")
+    return sb

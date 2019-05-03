@@ -3,12 +3,11 @@
 
 import gdb
 from typing import overload
-from crash.infra import CrashBaseClass
 from crash.infra.lookup import SymbolCallback
 
 decoders = {}
 
-class Decoder(CrashBaseClass):
+class Decoder(object):
 
     __endio__ = None
 
