@@ -11,7 +11,7 @@ from datetime import timedelta
 from crash.exceptions import DelayedAttributeError
 from crash.cache import CrashCache
 from crash.util import array_size
-from crash.util.symbols import Types, Symvals, SymbolCallbacks
+from crash.util.symbols import Types, Symvals, SymbolCallbacks, MinimalSymvals
 from crash.infra.lookup import DelayedValue
 
 class CrashUtsnameCache(CrashCache):
@@ -45,6 +45,8 @@ class CrashUtsnameCache(CrashCache):
 class CrashConfigCache(CrashCache):
     types = Types([ 'char *' ])
     symvals = Symvals([ 'kernel_config_data' ])
+    msymvals = MinimalSymvals([ 'kernel_config_data',
+                                'kernel_config_data_end' ])
 
     def __getattr__(self, name):
         if name == 'config_buffer':
@@ -53,39 +55,65 @@ class CrashConfigCache(CrashCache):
             return self._parse_config()
         return getattr(self.__class__, name)
 
-    @staticmethod
-    def read_buf(address, size):
+    def read_buf(self, address, size):
         return gdb.selected_inferior().read_memory(address, size)
 
-    @staticmethod
-    def read_buf_str(address, size):
-        buf = gdb.selected_inferior().read_memory(address, size)
-        if isinstance(buf, memoryview):
-            return buf.tobytes().decode('utf-8')
-        else:
-            return str(buf)
+    def read_buf_bytes(self, address, size):
+        return self.read_buf(address, size).tobytes()
+
+    def locate_config_buffer_section(self):
+        data_start = int(self.msymvals.kernel_config_data)
+        data_end = int(self.msymvals.kernel_config_data_end)
+
+        return {
+            'data' : {
+                'start' : data_start,
+                'size' : data_end - data_start,
+            },
+            'magic' : {
+                'start' : data_start - 8,
+                'end' : data_end,
+            },
+        }
+
+    def locate_config_buffer_typed(self):
+        start = int(self.symvals.kernel_config_data.address)
+        end = start + self.symvals.kernel_config_data.type.sizeof
+
+        return {
+            'data' : {
+                'start' : start + 8,
+                'size' : end - start - 2*8 - 1,
+            },
+            'magic' : {
+                'start' : start,
+                'end' : end - 8 - 1,
+            },
+        }
 
     def decompress_config_buffer(self):
-        MAGIC_START = 'IKCFG_ST'
-        MAGIC_END = 'IKCFG_ED'
+        MAGIC_START = b'IKCFG_ST'
+        MAGIC_END = b'IKCFG_ED'
 
-        # Must cast it to char * to do the pointer arithmetic correctly
-        data_addr = self.symvals.kernel_config_data.address.cast(self.types.char_p_type)
-        data_len = self.symvals.kernel_config_data.type.sizeof
+        try:
+            location = self.locate_config_buffer_section()
+        except DelayedAttributeError:
+            location = self.locate_config_buffer_typed()
 
         buf_len = len(MAGIC_START)
-        buf = self.read_buf_str(data_addr, buf_len)
+        buf = self.read_buf_bytes(location['magic']['start'], buf_len)
         if buf != MAGIC_START:
-            raise IOError("Missing MAGIC_START in kernel_config_data.")
+            raise IOError(f"Missing MAGIC_START in kernel_config_data. Got `{buf}'")
 
         buf_len = len(MAGIC_END)
-        buf = self.read_buf_str(data_addr + data_len - buf_len - 1, buf_len)
+        buf = self.read_buf_bytes(location['magic']['end'], buf_len)
         if buf != MAGIC_END:
-            raise IOError("Missing MAGIC_END in kernel_config_data.")
+            raise IOError("Missing MAGIC_END in kernel_config_data. Got `{buf}'")
 
         # Read the compressed data
-        buf_len = data_len - len(MAGIC_START) - len(MAGIC_END)
-        buf = self.read_buf(data_addr + len(MAGIC_START), buf_len)
+        buf = self.read_buf(location['data']['start'],
+                            location['data']['size'])
+
         self.config_buffer = zlib.decompress(buf, 16 + zlib.MAX_WBITS)
         if (isinstance(self.config_buffer, bytes)):
             self.config_buffer = str(self.config_buffer.decode('utf-8'))
